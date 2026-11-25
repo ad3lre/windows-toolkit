@@ -52,11 +52,16 @@ New-NetFirewallRule -DisplayName WinToolkit -Direction Inbound -Protocol TCP -Lo
 .\Install-WinToolkit.ps1 -Token 'PASTE_TOKEN' -Mode reverse -ConnectHost 'YOUR.LINUX.IP' -ConnectPort 47382 -StartNow
 ```
 
-On Linux for reverse:
+On Linux, run the persistent serve daemon (systemd user unit `wt-serve`):
 
 ```bash
-wt listen --port 47382
+systemctl --user enable --now wt-serve   # listens 0.0.0.0:47382
+wt status                                # agent: waiting | connected
+wt info                                  # once agent is up (via serve sock)
+wt shell
 ```
+
+One-shot interactive accept (no daemon): `wt listen --port 47382`
 
 ### 3. Use it
 

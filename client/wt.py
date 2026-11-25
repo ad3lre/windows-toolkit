@@ -19,6 +19,8 @@ from typing import Any, Callable, Optional
 DEFAULT_PORT = 47382
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "windows-toolkit"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "windows-toolkit"
+SERVE_SOCK = STATE_DIR / "serve.sock"
 
 
 class ProtocolError(RuntimeError):
@@ -230,11 +232,55 @@ def cmd_gen_token(_: argparse.Namespace) -> int:
     return 0
 
 
+class ServeProxy(WtClient):
+    """Talk to a local `wt serve` daemon instead of dialing Windows directly."""
+
+    def __init__(self, sock: socket.socket):
+        # Skip token auth — serve already authenticated the agent.
+        self.sock = sock
+        self.token = ""
+        self._buf = b""
+        self._lock = threading.Lock()
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._events: list[dict[str, Any]] = []
+        self._event_cv = threading.Condition(self._lock)
+        self._closed = False
+        self.hello = {"op": "hello", "via": "serve"}
+        self._reader = threading.Thread(target=self._read_loop, name="wt-serve-proxy", daemon=True)
+        self._reader.start()
+
+    @classmethod
+    def connect_serve(cls, path: Path = SERVE_SOCK, timeout: float = 5.0) -> "ServeProxy":
+        if not path.exists():
+            raise ConnectionError(f"wt serve not running (missing {path})")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(str(path))
+        sock.settimeout(None)
+        proxy = cls(sock)
+        # Probe
+        st = proxy.request("serve.status", wait=5.0)
+        if not st.get("agent_connected"):
+            proxy.close()
+            raise ConnectionError("wt serve is up but no Windows agent is connected yet")
+        return proxy
+
+    def auth(self, wait: float = 15.0) -> dict[str, Any]:
+        return self.request("serve.status", wait=wait)
+
+
 def with_client(args: argparse.Namespace, fn: Callable[[WtClient], int]) -> int:
     cfg = load_config()
-    token = resolve_token(args.token, cfg)
-    host, port = resolve_target(args.host, args.port, cfg)
-    client = WtClient.connect(host, port, token)
+    host = getattr(args, "host", None)
+    want_serve = host in ("@", "-", "serve", "local")
+    no_host = host in (None, "")
+    # Explicit serve marker, or no host and daemon sock present (and no default_host).
+    if want_serve or (no_host and SERVE_SOCK.exists() and not cfg.get("default_host")):
+        client: WtClient = ServeProxy.connect_serve()
+    else:
+        token = resolve_token(args.token, cfg)
+        h, port = resolve_target(host, args.port, cfg)
+        client = WtClient.connect(h, port, token)
     try:
         return fn(client)
     finally:
@@ -415,6 +461,222 @@ def cmd_rm(args: argparse.Namespace) -> int:
     return with_client(args, run)
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    print(f"config: {CONFIG_PATH} ({'yes' if CONFIG_PATH.is_file() else 'missing'})")
+    print(f"token:  {'set' if (args.token or os.environ.get('WINTOOLKIT_TOKEN') or cfg.get('token')) else 'MISSING'}")
+    print(f"serve:  {SERVE_SOCK} ({'up' if SERVE_SOCK.exists() else 'down'})")
+    if not SERVE_SOCK.exists():
+        return 1
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(3.0)
+        sock.connect(str(SERVE_SOCK))
+        sock.sendall(b'{"id":"st","op":"serve.status"}\n')
+        line = sock.makefile("rb").readline()
+        sock.close()
+        msg = json.loads(line.decode())
+        print(f"agent:  {'connected' if msg.get('agent_connected') else 'waiting'}")
+        if msg.get("agent"):
+            a = msg["agent"]
+            print(f"  host={a.get('hostname')} user={a.get('whoami')} system={a.get('is_system')} peer={a.get('peer')}")
+        return 0 if msg.get("ok") else 1
+    except OSError as exc:
+        print(f"serve:  error ({exc})")
+        return 1
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Persistent reverse-agent listener + local unix control socket for `wt` commands."""
+    cfg = load_config()
+    token = resolve_token(args.token, cfg)
+    port = getattr(args, "serve_port", None) or args.port or int(cfg.get("listen_port") or cfg.get("default_port") or DEFAULT_PORT)
+    bind = args.bind or "0.0.0.0"
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if SERVE_SOCK.exists():
+        try:
+            SERVE_SOCK.unlink()
+        except OSError:
+            pass
+
+    agent_lock = threading.Lock()
+    agent_holder: dict[str, Any] = {"client": None, "meta": None, "peer": None}
+    local_clients: list[socket.socket] = []
+    local_lock = threading.Lock()
+
+    def broadcast_event(ev: dict[str, Any]) -> None:
+        data = (json.dumps(ev, separators=(",", ":")) + "\n").encode()
+        with local_lock:
+            dead: list[socket.socket] = []
+            for lc in local_clients:
+                try:
+                    lc.sendall(data)
+                except OSError:
+                    dead.append(lc)
+            for d in dead:
+                try:
+                    local_clients.remove(d)
+                except ValueError:
+                    pass
+
+    def event_pump() -> None:
+        while True:
+            with agent_lock:
+                c: Optional[WtClient] = agent_holder["client"]
+            if c is None:
+                time.sleep(0.2)
+                continue
+            try:
+                for ev in c.pop_events():
+                    broadcast_event(ev)
+            except Exception:
+                pass
+            time.sleep(0.02)
+
+    threading.Thread(target=event_pump, name="wt-event-pump", daemon=True).start()
+
+    def handle_local(conn: socket.socket) -> None:
+        with local_lock:
+            local_clients.append(conn)
+        try:
+            f = conn.makefile("rb")
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line.decode())
+                except json.JSONDecodeError:
+                    conn.sendall(b'{"ok":false,"error":"invalid json"}\n')
+                    continue
+                mid = msg.get("id")
+                op = msg.get("op")
+                if op == "serve.status":
+                    with agent_lock:
+                        meta = agent_holder["meta"]
+                        peer = agent_holder["peer"]
+                        alive = agent_holder["client"] is not None and not agent_holder["client"]._closed
+                    payload = {
+                        "id": mid,
+                        "ok": True,
+                        "agent_connected": bool(alive),
+                        "agent": ({**(meta or {}), "peer": peer} if alive else None),
+                        "listen": f"{bind}:{port}",
+                    }
+                    conn.sendall((json.dumps(payload) + "\n").encode())
+                    continue
+                with agent_lock:
+                    agent: Optional[WtClient] = agent_holder["client"]
+                    if agent is None or agent._closed:
+                        conn.sendall(
+                            (json.dumps({"id": mid, "ok": False, "error": "no agent connected"}) + "\n").encode()
+                        )
+                        continue
+                # Forward to agent
+                fields = {k: v for k, v in msg.items() if k not in ("id",)}
+                try:
+                    op_name = fields.pop("op")
+                    wait = float(fields.get("timeout", 120)) + 5.0 if op_name == "exec" else 120.0
+                    resp = agent.request(op_name, wait=wait, **fields)
+                    resp = dict(resp)
+                    resp["id"] = mid
+                    conn.sendall((json.dumps(resp, separators=(",", ":")) + "\n").encode())
+                except Exception as exc:
+                    conn.sendall(
+                        (json.dumps({"id": mid, "ok": False, "error": str(exc)}) + "\n").encode()
+                    )
+        finally:
+            with local_lock:
+                if conn in local_clients:
+                    local_clients.remove(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def local_accept_loop(srv: socket.socket) -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=handle_local, args=(conn,), daemon=True).start()
+
+    local_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    local_srv.bind(str(SERVE_SOCK))
+    os.chmod(SERVE_SOCK, 0o600)
+    local_srv.listen(16)
+    threading.Thread(target=local_accept_loop, args=(local_srv,), daemon=True).start()
+
+    agent_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    agent_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    agent_srv.bind((bind, port))
+    agent_srv.listen(5)
+    print(f"[wt] serve listening for agents on {bind}:{port}", flush=True)
+    print(f"[wt] local control socket {SERVE_SOCK}", flush=True)
+
+    try:
+        while True:
+            conn, addr = agent_srv.accept()
+            print(f"[wt] agent dial-in from {addr[0]}:{addr[1]}", flush=True)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                client = WtClient(conn, token)
+                client._await_hello(timeout=30.0)
+                auth = client.auth(wait=30.0)
+                meta = {
+                    "whoami": auth.get("whoami"),
+                    "is_system": auth.get("is_system"),
+                    "hostname": auth.get("hostname"),
+                }
+                print(
+                    f"[wt] authenticated {meta.get('hostname')} as {meta.get('whoami')} "
+                    f"system={meta.get('is_system')}",
+                    flush=True,
+                )
+                with agent_lock:
+                    old = agent_holder["client"]
+                    agent_holder["client"] = client
+                    agent_holder["meta"] = meta
+                    agent_holder["peer"] = f"{addr[0]}:{addr[1]}"
+                if old is not None:
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
+                # Hold until agent disconnects
+                while not client._closed:
+                    time.sleep(0.5)
+                print(f"[wt] agent disconnected ({addr[0]}:{addr[1]})", flush=True)
+            except Exception as exc:
+                print(f"[wt] agent session error: {exc}", flush=True)
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            finally:
+                with agent_lock:
+                    if agent_holder.get("peer") == f"{addr[0]}:{addr[1]}":
+                        agent_holder["client"] = None
+                        agent_holder["meta"] = None
+                        agent_holder["peer"] = None
+    finally:
+        try:
+            local_srv.close()
+        except OSError:
+            pass
+        try:
+            SERVE_SOCK.unlink()
+        except OSError:
+            pass
+        try:
+            agent_srv.close()
+        except OSError:
+            pass
+    return 0
+
+
 def cmd_listen(args: argparse.Namespace) -> int:
     """Accept reverse connections from Windows agents; drop into shell/info."""
     cfg = load_config()
@@ -435,7 +697,7 @@ def cmd_listen(args: argparse.Namespace) -> int:
         client = WtClient(conn, token)
         try:
             client._await_hello(timeout=30.0)
-            auth = client.auth(timeout=30.0)
+            auth = client.auth(wait=30.0)
             print(
                 f"[wt] authenticated as {auth.get('whoami')} "
                 f"system={auth.get('is_system')} host={auth.get('hostname')}",
@@ -564,13 +826,21 @@ def build_parser() -> argparse.ArgumentParser:
     rm.add_argument("-r", "--recurse", action="store_true")
     rm.set_defaults(func=cmd_rm)
 
-    listen = sub.add_parser("listen", help="accept reverse connections from agents")
+    listen = sub.add_parser("listen", help="accept reverse connections from agents (interactive)")
     listen.add_argument("--bind", default="0.0.0.0")
     listen.add_argument("--shell", choices=["powershell", "cmd"], default="powershell")
     listen.add_argument("--cwd", default="")
     listen.add_argument("--once", action="store_true", help="handle one agent then exit")
     listen.add_argument("--once-info", action="store_true", help="print info and exit (implies --once)")
     listen.set_defaults(func=cmd_listen)
+
+    serve = sub.add_parser("serve", help="persistent daemon: accept reverse agents + local wt proxy")
+    serve.add_argument("--bind", default="0.0.0.0")
+    serve.add_argument("--port", type=int, default=None, dest="serve_port")
+    serve.set_defaults(func=cmd_serve)
+
+    st = sub.add_parser("status", help="show local serve daemon / agent connection state")
+    st.set_defaults(func=cmd_status)
 
     return p
 

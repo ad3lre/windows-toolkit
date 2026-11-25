@@ -1,0 +1,15 @@
+[Unit]
+Description=WinToolkit reverse-agent serve (Linux side)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/prod/windows-toolkit/client/wt.py --port 47382 serve --bind 0.0.0.0
+Restart=always
+RestartSec=2
+# Token comes from ~/.config/windows-toolkit/config.json
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
