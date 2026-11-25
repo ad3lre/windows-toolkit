@@ -1,0 +1,7 @@
+{
+  "token": "REPLACE_WITH_SHARED_TOKEN",
+  "listen_port": 47382,
+  "bind_address": "0.0.0.0",
+  "connect_host": "",
+  "connect_port": 47382
+}

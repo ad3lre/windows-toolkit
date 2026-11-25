@@ -1,0 +1,27 @@
+# Secrets / local config
+.env
+*.token
+*.pem
+*.key
+*.crt
+config/local.*
+agent/local.*
+~/.config/windows-toolkit/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Agent runtime
+agent/logs/
+*.log

@@ -1,0 +1,16 @@
+[Unit]
+Description=WinToolkit reverse-agent listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Environment=WINTOOLKIT_TOKEN=REPLACE_ME
+ExecStart=/usr/bin/python3 %h/prod/windows-toolkit/client/wt.py listen --bind 0.0.0.0 --port 47382 --once-info
+# Prefer interactive use via `wt listen`; this unit is a template for always-on accept+info logging.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
